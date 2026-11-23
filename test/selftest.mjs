@@ -8,7 +8,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
@@ -427,8 +427,10 @@ await test('批量删除：一次移入多个会话，个别失败不影响其�
     })
     assert.equal(partial.ok, true)
     assert.equal(partial.trashed, 1)
-    assert.equal(partial.failed, 1)
-    assert.match(partial.text, /1 个失败/u)
+    // 不存在的 id 现在按「已不在磁盘上」处理（幂等），不再计为失败
+    assert.equal(partial.failed, 0)
+    assert.equal(partial.missing, 1)
+    assert.match(partial.text, /1 个已不在磁盘上/u)
 
     // 「使用中」的会话也照删（与单个删除一致），只在结果里点明它们要等 DSH 释放
     writeSession(home, '--F-18752-Documents-b--', 'session-b5', [
@@ -494,7 +496,9 @@ await test('彻底删除与清空回收站都需要确认', async () => {
     assert.equal(existsSync(sessionDir), false)
 
     const trashed = await runAction(ctx, { home, action: 'trash', session: 'session-aaa' })
-    assert.equal(trashed.ok, false, '会话已删，不该还能移入回收站')
+    // 会话已不存在：按幂等处理，不移动任何东西也不算失败（面板刷新后自然消失）
+    assert.equal(trashed.trashed, 0, '会话已删，不该真的移入回收站')
+    assert.equal(trashed.missing, 1)
 
     writeSession(home, '--F-18752-Documents-a--', 'session-ccc', [
       { type: 'session', cwd: 'F:\\18752\\Documents\\a', createdAt: 3 },
@@ -594,6 +598,48 @@ await test('命令解析与同步动作', async () => {
   }
 })
 
+await test('删除已不存在的会话按幂等处理，不再报失败', async () => {
+  const { home, cleanup } = makeHome()
+  try {
+    const ctx = { get: () => undefined }
+    // 批量：全部 id 都不在磁盘上
+    const bulk = await runAction(ctx, { home, action: 'trash', sessions: ['session-gone1', 'session-gone2'] })
+    assert.equal(bulk.ok, true, '已不存在的会话不该报失败')
+    assert.equal(bulk.trashed, 0)
+    assert.equal(bulk.missing, 2)
+    assert.match(bulk.text, /2 个已不在磁盘上/u)
+    // 单条：同样给友好结果
+    const single = await runAction(ctx, { home, action: 'trash', session: 'session-gone3' })
+    assert.equal(single.ok, true)
+    assert.equal(single.missing, 1)
+    assert.match(single.text, /已不在磁盘上/u)
+  } finally {
+    cleanup()
+  }
+})
+
+await test('会话文件被占用时给出可读提示而不是 EPERM 原文', async () => {
+  const { home, cleanup } = makeHome()
+  let handle = null
+  try {
+    writeSession(home, '--F-18752-Documents-lock--', 'session-lock', [
+      { type: 'session', cwd: 'F:\\18752\\Documents\\lock', createdAt: 40 },
+      { type: 'session/title', data: { title: '被占用' } },
+    ])
+    // 模拟 DSH 持有写句柄：打开日志文件不关闭，rename 会失败
+    const logPath = join(home, 'sessions', '--F-18752-Documents-lock--', 'session-lock', 'session.jsonl.zstd')
+    if (existsSync(logPath)) {
+      handle = openSync(logPath, 'a')
+      const res = await runAction({ get: () => undefined }, { home, action: 'trash', session: 'session-lock' })
+      assert.equal(res.ok, false)
+      assert.match(res.text, /正被 DSH 占用/u, '应给出可读提示：' + res.text)
+      assert.equal(/EPERM:/u.test(res.text), false, '不该把 EPERM 原文抛给用户')
+    }
+  } finally {
+    if (handle !== null) closeSync(handle)
+    cleanup()
+  }
+})
 await test('改名兼容：旧数据文件与旧回收站清单仍能读', async () => {
   const { home, cleanup } = makeHome()
   try {
