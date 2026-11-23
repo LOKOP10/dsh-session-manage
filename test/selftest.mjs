@@ -455,6 +455,25 @@ await test('批量删除：一次移入多个会话，个别失败不影响其�
   }
 })
 
+await test('只选 1 个会话也走批量删除（sessions 单元素）', async () => {
+  const { home, cleanup } = makeHome()
+  try {
+    writeSession(home, '--F-18752-Documents-a--', 'session-solo', [
+      { type: 'session', cwd: 'F:\\18752\\Documents\\a', createdAt: 5 },
+      { type: 'session/title', data: { title: '单个' } },
+    ])
+    const result = await runAction({ get: () => undefined }, {
+      home,
+      action: 'trash',
+      sessions: ['session-solo'],
+    })
+    assert.equal(result.ok, true, result.text)
+    assert.equal(result.trashed, 1)
+    assert.equal(existsSync(join(home, 'sessions', '--F-18752-Documents-a--', 'session-solo')), false)
+  } finally {
+    cleanup()
+  }
+})
 await test('彻底删除与清空回收站都需要确认', async () => {
   const { home, cleanup } = makeHome()
   try {
